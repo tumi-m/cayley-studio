@@ -1,0 +1,10 @@
+node_modules
+dist
+.output
+.tanstack
+.nitro
+*.log
+.DS_Store
+screenshots
+artifacts
+.grok/og-pending
