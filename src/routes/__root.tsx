@@ -14,9 +14,9 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "Cinematic 3D Rubik's cube and Cayley graph studio. Shortest paths, search waves, and generated films.",
+          "Solving a Rubik’s cube with graph theory. A 3D Cayley graph of cube states — each node a cube, each edge a turn.",
       },
-      { name: "theme-color", content: "#08080a" },
+      { name: "theme-color", content: "#050506" },
     ],
     links: [
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },

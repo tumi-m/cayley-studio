@@ -1,15 +1,15 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #08080a;
-  --color-elevated: #121214;
-  --color-surface: #1c1c20;
+  --color-bg: #050506;
+  --color-elevated: #16161a;
+  --color-surface: #1c1c22;
   --color-fg: #ece8df;
-  --color-muted: #9a968e;
-  --color-dim: #6e6b66;
+  --color-muted: #9a958c;
+  --color-dim: #6f6b64;
   --color-border: color-mix(in oklab, var(--color-fg) 14%, transparent);
-  --color-accent: #ece8df;
-  --color-accent-fg: #08080a;
+  --color-accent: #c8ccd4;
+  --color-accent-fg: #050506;
   --color-ring: #c8ccd4;
   --font-sans: "Outfit", system-ui, sans-serif;
   --font-display: "Fraunces", "Times New Roman", serif;
@@ -50,17 +50,19 @@
     text-wrap: balance;
   }
 
-  .wordmark {
-    font-family: var(--font-display);
-    font-size: clamp(2rem, 6vw, 3.25rem);
-    font-weight: 500;
-    line-height: 0.9;
-    letter-spacing: -0.04em;
-    text-wrap: balance;
-  }
-
   p {
     text-wrap: pretty;
+  }
+
+  .stage-vignette {
+    pointer-events: none;
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      ellipse at 50% 46%,
+      transparent 38%,
+      color-mix(in oklab, var(--color-bg) 72%, transparent) 100%
+    );
   }
 
   @media (prefers-reduced-motion: reduce) {

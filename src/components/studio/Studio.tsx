@@ -30,12 +30,15 @@ export function Studio() {
 
   return (
     <main className="relative h-dvh min-h-[100dvh] overflow-hidden bg-bg text-fg">
-      <h1 className="sr-only">Cayley — Rubik's cube graph studio</h1>
+      <h1 className="sr-only">
+        Cayley — solving a Rubik’s cube with graph theory
+      </h1>
       <canvas
         ref={canvasRef}
         className="absolute inset-0 size-full touch-none"
-        aria-label="3D Rubik's cube and Cayley graph"
+        aria-label="3D Cayley graph of Rubik’s cube states"
       />
+      <div className="stage-vignette" aria-hidden="true" />
       <Overlay />
     </main>
   );

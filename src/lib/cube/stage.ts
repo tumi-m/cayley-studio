@@ -7,16 +7,18 @@ import {
   CatmullRomCurve3,
   Color,
   DirectionalLight,
-  Fog,
+  FogExp2,
   Group,
   HemisphereLight,
   LineBasicMaterial,
   LineSegments,
   Matrix4,
   Mesh,
+  MeshBasicMaterial,
+  MeshLambertMaterial,
   MeshPhysicalMaterial,
-  MeshStandardMaterial,
   PerspectiveCamera,
+  PointLight,
   Quaternion,
   Scene,
   SRGBColorSpace,
@@ -25,9 +27,7 @@ import {
   Vector2,
   Vector3,
   WebGLRenderer,
-  type Material,
 } from "three";
-import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
 import {
   COLOR,
@@ -40,43 +40,30 @@ import {
   type Cubie,
   type Move,
 } from "./model";
-import {
-  buildCayleyCloud,
-  buildShortestPathGraph,
-  FILM_SCRIPTS,
-  type CubeGraph,
-  type FilmId,
-} from "./graph";
+import { buildPathGraph, type CubeGraph, type GraphNode } from "./graph";
+import { buildNodeGeometry } from "./mesh";
 
 export interface StageSnapshot {
-  caption: string;
-  filmId: FilmId;
   playing: boolean;
-  recording: boolean;
   ready: boolean;
   phase: string;
   moveLabel: string;
-  speed: number;
   nodes: number;
-  depth: number;
-  path: number;
-  explored: number;
-  shortest: boolean;
-  currentPath: number;
+  step: number;
+  total: number;
 }
 
-type Job =
-  | { kind: "caption"; text: string }
-  | { kind: "wait"; seconds: number }
-  | { kind: "moves"; moves: Move[]; label: string }
-  | { kind: "reveal" }
-  | { kind: "hero"; cube: Cube };
+const VOID = 0x050506;
+const NODE_SCALE = 1.28;
+const PATH_SCALE = 1.38;
+const HERO_SCALE = 1.72;
 
 const PLASTIC = new MeshPhysicalMaterial({
   color: COLOR.PLASTIC,
-  roughness: 0.48,
-  metalness: 0.12,
-  clearcoat: 0.15,
+  roughness: 0.42,
+  metalness: 0.08,
+  clearcoat: 0.28,
+  clearcoatRoughness: 0.45,
 });
 
 const stickerCache = new Map<number, MeshPhysicalMaterial>();
@@ -85,10 +72,10 @@ function stickerMat(hex: number): MeshPhysicalMaterial {
   if (!m) {
     m = new MeshPhysicalMaterial({
       color: hex,
-      roughness: 0.32,
-      metalness: 0.04,
+      roughness: 0.28,
+      metalness: 0.02,
       clearcoat: 0.55,
-      clearcoatRoughness: 0.28,
+      clearcoatRoughness: 0.22,
     });
     stickerCache.set(hex, m);
   }
@@ -97,41 +84,6 @@ function stickerMat(hex: number): MeshPhysicalMaterial {
 
 function easeInOut(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-
-function paintBox(geo: BufferGeometry, colors: number[]): void {
-  const pos = geo.getAttribute("position");
-  const arr = new Float32Array(pos.count * 3);
-  const c = new Color();
-  for (let f = 0; f < 6; f++) {
-    c.setHex(colors[f] ?? COLOR.PLASTIC);
-    for (let v = 0; v < 4; v++) {
-      const i = f * 4 + v;
-      arr[i * 3] = c.r;
-      arr[i * 3 + 1] = c.g;
-      arr[i * 3 + 2] = c.b;
-    }
-  }
-  geo.setAttribute("color", new BufferAttribute(arr, 3));
-}
-
-function miniGeometry(cube: Cube, scale: number): BufferGeometry {
-  const geos: BufferGeometry[] = [];
-  for (const cubie of cube.cubies) {
-    const box = new BoxGeometry(0.86 * scale, 0.86 * scale, 0.86 * scale);
-    paintBox(box, cubieWorldColors(cubie));
-    box.translate(
-      cubie.pos[0] * scale,
-      cubie.pos[1] * scale,
-      cubie.pos[2] * scale,
-    );
-    geos.push(box);
-  }
-  const merged = mergeGeometries(geos, false);
-  for (const g of geos) g.dispose();
-  if (!merged) return new BoxGeometry(scale, scale, scale);
-  merged.computeVertexNormals();
-  return merged;
 }
 
 function rotMatrix(cubie: Cubie): Matrix4 {
@@ -167,20 +119,31 @@ export class CayleyStage {
   private raf = 0;
   private disposed = false;
 
+  private graphRoot = new Group();
+  private nodeMeshes: Mesh[] = [];
+  private nodeMat: MeshLambertMaterial;
+  private edgeLines: LineSegments | null = null;
+  private pathMesh: Mesh | null = null;
+  private pathGlow: Mesh | null = null;
+  private pathMat: MeshBasicMaterial;
+  private glowMat: MeshBasicMaterial;
+  private cursorLight: PointLight;
+
   private heroRoot = new Group();
   private pivot = new Group();
   private cubieMeshes: { mesh: Group; cubie: Cubie }[] = [];
   private logical = Cube.solved(3);
+  private heroTarget = new Vector3();
+  private lookTarget = new Vector3();
 
-  private graphRoot = new Group();
   private graph: CubeGraph | null = null;
-  private nodeMeshes: Mesh[] = [];
-  private nodeMat: MeshStandardMaterial | null = null;
-  private pathGlow: Mesh | null = null;
-  private reveal = 1;
+  private walkCursor = 0;
+  private trail = 0;
+  private phase: "scramble" | "solve" | "hold" = "hold";
+  private holdLeft = 0;
+  private queue: Move[] = [];
+  private queueKind: "scramble" | "solve" = "scramble";
 
-  private jobs: Job[] = [];
-  private waitLeft = 0;
   private anim: {
     axis: "x" | "y" | "z";
     angle: number;
@@ -189,60 +152,74 @@ export class CayleyStage {
     members: Group[];
     move: Move;
   } | null = null;
-  private moveQueue: Move[] = [];
 
-  private spherical = { theta: 0.72, phi: 0.42, radius: 15.5 };
+  private spherical = { theta: 0.62, phi: 1.08, radius: 12.4 };
   private dragging = false;
   private lastPtr = new Vector2();
-  private autoOrbit = true;
-  private pointerLeft = false;
+  private reduceMotion = false;
+  private ro: ResizeObserver | null = null;
 
   speed = 1;
   playing = true;
-  recording = false;
   ready = false;
-  filmId: FilmId = "shortest";
-  caption: string = FILM_SCRIPTS.shortest.caption;
-  phase: string = "boot";
   moveLabel = "";
-  currentPath = 0;
-
-  private recorder: MediaRecorder | null = null;
-  private recChunks: Blob[] = [];
+  phaseLabel = "Loading";
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
+    this.reduceMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+
     this.renderer = new WebGLRenderer({
       canvas,
       antialias: true,
       alpha: false,
-      preserveDrawingBuffer: true,
       powerPreference: "high-performance",
+      preserveDrawingBuffer: true,
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    this.renderer.setClearColor(0x08080a, 1);
+    this.renderer.setClearColor(VOID, 1);
     this.renderer.toneMapping = ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
     this.renderer.outputColorSpace = SRGBColorSpace;
 
     this.scene = new Scene();
-    this.scene.fog = new Fog(0x08080a, 18, 44);
-    this.camera = new PerspectiveCamera(42, 1, 0.1, 120);
+    this.scene.background = new Color(VOID);
+    this.scene.fog = new FogExp2(VOID, 0.016);
+    this.camera = new PerspectiveCamera(38, 1, 0.1, 120);
 
-    this.scene.add(new HemisphereLight(0xc9cdd4, 0x0a0a0c, 0.72));
-    const key = new DirectionalLight(0xfff6ea, 1.45);
-    key.position.set(7, 11, 8);
+    this.scene.add(new HemisphereLight(0xb8c4d8, 0x0a0a0c, 0.85));
+    const key = new DirectionalLight(0xfff4e8, 1.55);
+    key.position.set(8, 14, 6);
     this.scene.add(key);
-    const fill = new DirectionalLight(0xb7c4d8, 0.38);
-    fill.position.set(-9, 3, -5);
+    const fill = new DirectionalLight(0x6a7a99, 0.35);
+    fill.position.set(-10, 4, -8);
     this.scene.add(fill);
-    const rim = new DirectionalLight(0xd4b86a, 0.22);
-    rim.position.set(2, -6, 9);
+    const rim = new DirectionalLight(0xffd9a0, 0.28);
+    rim.position.set(0, -6, 10);
     this.scene.add(rim);
 
+    this.nodeMat = new MeshLambertMaterial({ vertexColors: true });
+    this.pathMat = new MeshBasicMaterial({
+      color: 0xffc56a,
+      transparent: true,
+      opacity: 0.95,
+    });
+    this.glowMat = new MeshBasicMaterial({
+      color: 0xff9a3a,
+      transparent: true,
+      opacity: 0.22,
+      blending: AdditiveBlending,
+      depthWrite: false,
+    });
+
+    this.cursorLight = new PointLight(0xffc56a, 2.4, 6.5, 1.6);
+    this.scene.add(this.cursorLight);
+
     this.heroRoot.add(this.pivot);
-    this.scene.add(this.heroRoot);
     this.scene.add(this.graphRoot);
+    this.scene.add(this.heroRoot);
     this.buildHero();
     this.resize();
     this.bind();
@@ -250,9 +227,9 @@ export class CayleyStage {
   }
 
   start(): void {
+    this.rebuild(2026);
     this.ready = true;
     this.emit();
-    this.playFilm("shortest");
     const loop = () => {
       if (this.disposed) return;
       this.raf = requestAnimationFrame(loop);
@@ -268,79 +245,29 @@ export class CayleyStage {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.unbind();
-    this.clearGraph();
+    this.clearGraphMeshes();
     this.renderer.dispose();
   }
 
-  playFilm(id: FilmId): void {
-    this.filmId = id;
-    this.jobs = [];
-    this.moveQueue = [];
-    this.playing = true;
-    if (this.anim) {
-      for (const mesh of this.anim.members) this.heroRoot.attach(mesh);
-      this.pivot.rotation.set(0, 0, 0);
-      this.anim = null;
-    }
-    const script = FILM_SCRIPTS[id];
-    this.caption = script.caption;
-    this.phase = script.title;
-    const seed = (Date.now() ^ (id.length * 997)) >>> 0;
-    const graph =
-      id === "cloud"
-        ? buildCayleyCloud(8, seed)
-        : buildShortestPathGraph(id === "search" ? 4 : 4, seed);
-    this.setGraph(graph);
+  rebuild(seed?: number): void {
+    this.anim = null;
+    this.pivot.rotation.set(0, 0, 0);
+    this.queue = [];
+    const s = seed ?? (Math.random() * 0xffffffff) >>> 0;
+    this.graph = buildPathGraph(s, 12);
+    this.rebuildGraphMeshes();
     this.resetLogical();
-    this.reveal = 0;
-    this.currentPath = 0;
-    this.jobs.push({ kind: "caption", text: script.caption });
-    this.jobs.push({ kind: "wait", seconds: 0.4 });
-    this.jobs.push({ kind: "moves", moves: graph.scramble, label: "Scramble" });
-    this.jobs.push({ kind: "reveal" });
-    this.jobs.push({
-      kind: "caption",
-      text: graph.shortest
-        ? `Shortest path · ${graph.solution.length} moves · ${graph.explored.toLocaleString()} states visited`
-        : `A walk on the Cayley graph · ${graph.solution.length} moves home`,
-    });
-    this.jobs.push({ kind: "wait", seconds: 0.6 });
-    this.jobs.push({ kind: "moves", moves: graph.solution, label: "Solve" });
-    this.jobs.push({
-      kind: "caption",
-      text: "Solved. The cube is a vertex. A turn is an edge.",
-    });
+    this.walkCursor = 0;
+    this.trail = 0;
+    this.placeHero(true);
+    this.syncNodeVisibility();
+    this.rebuildPathTube();
+    this.beginScramble();
     this.emit();
   }
 
   scrambleNow(): void {
-    this.playFilm(this.filmId);
-  }
-
-  solveNow(): void {
-    if (!this.graph) return;
-    this.jobs = [];
-    this.moveQueue = [];
-    this.jobs.push({ kind: "moves", moves: this.graph.solution, label: "Solve" });
-    this.playing = true;
-    this.emit();
-  }
-
-  enqueueMove(move: Move): void {
-    this.moveQueue.push(move);
-    this.playing = true;
-    this.emit();
-  }
-
-  resetSolved(): void {
-    this.jobs = [];
-    this.moveQueue = [];
-    this.anim = null;
-    this.resetLogical();
-    this.currentPath = 0;
-    this.phase = "idle";
-    this.moveLabel = "";
-    this.emit();
+    this.rebuild();
   }
 
   setPlaying(v: boolean): void {
@@ -348,65 +275,15 @@ export class CayleyStage {
     this.emit();
   }
 
-  setSpeed(v: number): void {
-    this.speed = v;
-    this.emit();
-  }
-
-  toggleOrbit(): void {
-    this.autoOrbit = !this.autoOrbit;
-  }
-
-  async toggleRecord(): Promise<void> {
-    if (this.recording) {
-      this.recorder?.stop();
-      return;
-    }
-    const stream = this.canvas.captureStream(30);
-    const rec = new MediaRecorder(stream, {
-      mimeType: MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
-        ? "video/webm;codecs=vp9"
-        : "video/webm",
-    });
-    this.recChunks = [];
-    rec.ondataavailable = (e) => {
-      if (e.data.size) this.recChunks.push(e.data);
-    };
-    rec.onstop = () => {
-      const blob = new Blob(this.recChunks, { type: "video/webm" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `cayley-${this.filmId}.webm`;
-      a.click();
-      URL.revokeObjectURL(url);
-      this.recording = false;
-      this.recorder = null;
-      this.emit();
-    };
-    this.recorder = rec;
-    rec.start();
-    this.recording = true;
-    this.emit();
-  }
-
   snapshot(): StageSnapshot {
-    const g = this.graph;
     return {
-      caption: this.caption,
-      filmId: this.filmId,
       playing: this.playing,
-      recording: this.recording,
       ready: this.ready,
-      phase: this.phase,
+      phase: this.phaseLabel,
       moveLabel: this.moveLabel,
-      speed: this.speed,
-      nodes: g?.nodes.length ?? 0,
-      depth: g ? Math.max(0, ...g.nodes.map((n) => n.depth)) : 0,
-      path: g?.solution.length ?? 0,
-      explored: g?.explored ?? 0,
-      shortest: g?.shortest ?? false,
-      currentPath: this.currentPath,
+      nodes: this.graph?.nodes.length ?? 0,
+      step: this.trail,
+      total: Math.max((this.graph?.walk.length ?? 1) - 1, 0),
     };
   }
 
@@ -414,92 +291,89 @@ export class CayleyStage {
     this.onChange?.(this.snapshot());
   }
 
+  private beginScramble(): void {
+    if (!this.graph) return;
+    this.phase = "scramble";
+    this.queueKind = "scramble";
+    this.queue = this.graph.scramble.slice();
+    this.phaseLabel = "Scramble";
+    this.playing = true;
+    this.emit();
+  }
+
+  private beginSolve(): void {
+    if (!this.graph) return;
+    this.phase = "solve";
+    this.queueKind = "solve";
+    this.queue = this.graph.solution.slice();
+    this.phaseLabel = "Solve";
+    this.emit();
+  }
+
   private tick(dt: number): void {
-    if (this.autoOrbit && !this.dragging) {
-      this.spherical.theta += dt * 0.14;
+    if (!this.dragging && !this.reduceMotion) {
+      this.spherical.theta += dt * 0.12;
     }
-    this.placeCamera();
-
-    if (this.pathGlow) {
-      const pulse = 0.55 + Math.sin(this.timer.getElapsed() * 2.2) * 0.2;
-      const mat = this.pathGlow.material as MeshStandardMaterial;
-      mat.opacity = pulse;
-    }
-
-    for (let i = 0; i < this.nodeMeshes.length; i++) {
-      const mesh = this.nodeMeshes[i]!;
-      const node = this.graph?.nodes[i];
-      if (!node) continue;
-      const isCurrent =
-        this.graph && this.graph.path[this.currentPath] === node.id;
-      const target = this.reveal * (node.onPath ? 1 : 0.92) * (isCurrent ? 1.28 : 1);
-      mesh.scale.setScalar(mesh.scale.x + (target - mesh.scale.x) * Math.min(1, dt * 6));
-    }
+    this.placeHero(false);
+    this.placeCamera(dt);
 
     if (!this.playing) return;
+
+    if (this.phase === "hold") {
+      this.holdLeft -= dt;
+      if (this.holdLeft <= 0) {
+        if (this.walkCursor <= 0) this.beginScramble();
+        else this.beginSolve();
+      }
+      return;
+    }
 
     if (this.anim) {
       this.stepAnim(dt);
       return;
     }
 
-    if (this.moveQueue.length) {
-      this.beginMove(this.moveQueue.shift()!);
+    if (this.queue.length) {
+      this.beginMove(this.queue.shift()!);
       return;
     }
 
-    if (this.waitLeft > 0) {
-      this.waitLeft -= dt;
+    if (this.phase === "scramble") {
+      this.phase = "hold";
+      this.holdLeft = 0.9;
+      this.phaseLabel = "Path";
+      this.emit();
       return;
     }
 
-    const job = this.jobs.shift();
-    if (!job) return;
-    if (job.kind === "caption") {
-      this.caption = job.text;
-      this.emit();
-    } else if (job.kind === "wait") {
-      this.waitLeft = job.seconds;
-    } else if (job.kind === "moves") {
-      this.phase = job.label;
-      this.moveQueue.push(...job.moves);
-      this.emit();
-    } else if (job.kind === "reveal") {
-      this.reveal = 1;
-      this.phase = "Graph";
-      this.emit();
-    } else if (job.kind === "hero") {
+    if (this.phase === "solve") {
       this.resetLogical();
-      this.logical.applySequence(
-        // hero job unused in current films; keep for completeness
-        [],
-      );
-      void job.cube;
-      this.snapHero();
+      this.walkCursor = 0;
+      this.trail = 0;
+      this.syncNodeVisibility();
+      this.rebuildPathTube();
+      this.phase = "hold";
+      this.holdLeft = 1.15;
+      this.phaseLabel = "Solved";
+      this.emit();
     }
   }
 
   private beginMove(move: Move): void {
-    const { face } = parseMove(move);
+    const { face, turns } = parseMove(move);
     const { axis, layer } = FACE_AXIS[face];
-    const k = ((rhQuarters(move) % 4) + 4) % 4;
+    const k = rhQuarters(move);
     const angle = (k * Math.PI) / 2;
-    const axisName: "x" | "y" | "z" = axis === 0 ? "x" : axis === 1 ? "y" : "z";
-    this.pivot.rotation.set(0, 0, 0);
+    const ax = axis === 0 ? "x" : axis === 1 ? "y" : "z";
     const members: Group[] = [];
     for (const { mesh, cubie } of this.cubieMeshes) {
-      if (cubie.pos[axis] !== layer) continue;
+      const live = this.liveCubie(cubie);
+      if (!live || live.pos[axis] !== layer) continue;
       this.pivot.attach(mesh);
       members.push(mesh);
     }
-    this.anim = {
-      axis: axisName,
-      angle,
-      t: 0,
-      duration: (0.28 + (k === 2 ? 0.12 : 0)) / this.speed,
-      members,
-      move,
-    };
+    const duration = (turns === 2 ? 0.72 : 0.52) / this.speed;
+    this.anim = { axis: ax, angle, t: 0, duration, members, move };
     this.moveLabel = move;
     this.emit();
   }
@@ -514,14 +388,30 @@ export class CayleyStage {
     this.pivot.rotation.set(0, 0, 0);
     this.logical.apply(this.anim.move);
     this.snapHero();
-    if (this.graph) {
-      const k = this.logical.key();
-      const idx = this.graph.path.indexOf(k);
-      if (idx >= 0) this.currentPath = idx;
+    if (this.queueKind === "scramble") {
+      this.walkCursor = Math.min(
+        this.walkCursor + 1,
+        (this.graph?.walk.length ?? 1) - 1,
+      );
+      this.trail = this.walkCursor;
+    } else {
+      this.walkCursor = Math.max(this.walkCursor - 1, 0);
+      this.trail = Math.max(this.trail, this.walkCursor);
     }
     this.anim = null;
     this.moveLabel = "";
+    this.syncNodeVisibility();
+    this.rebuildPathTube();
     this.emit();
+  }
+
+  private liveCubie(cubie: Cubie): Cubie | undefined {
+    return this.logical.cubies.find(
+      (c) =>
+        c.home[0] === cubie.home[0] &&
+        c.home[1] === cubie.home[1] &&
+        c.home[2] === cubie.home[2],
+    );
   }
 
   private resetLogical(): void {
@@ -532,118 +422,11 @@ export class CayleyStage {
     this.snapHero();
   }
 
-  private setGraph(graph: CubeGraph): void {
-    this.clearGraph();
-    this.graph = graph;
-    this.nodeMat = new MeshStandardMaterial({
-      vertexColors: true,
-      roughness: 0.4,
-      metalness: 0.08,
-    });
-    for (const node of graph.nodes) {
-      const scale = node.onPath ? 0.34 : 0.26;
-      const geo = miniGeometry(node.cube, scale);
-      const mesh = new Mesh(geo, this.nodeMat);
-      mesh.position.set(...node.position);
-      mesh.scale.setScalar(0);
-      this.graphRoot.add(mesh);
-      this.nodeMeshes.push(mesh);
-    }
-    const edgePos: number[] = [];
-    const idTo = new Map(graph.nodes.map((n) => [n.id, n] as const));
-    for (const e of graph.edges) {
-      const a = idTo.get(e.from);
-      const b = idTo.get(e.to);
-      if (!a || !b) continue;
-      if (e.onPath) continue;
-      edgePos.push(...a.position, ...b.position);
-    }
-    if (edgePos.length) {
-      const g = new BufferGeometry();
-      g.setAttribute("position", new BufferAttribute(new Float32Array(edgePos), 3));
-      const lines = new LineSegments(
-        g,
-        new LineBasicMaterial({
-          color: 0x3a3c44,
-          transparent: true,
-          opacity: 0.55,
-        }),
-      );
-      lines.name = "edges";
-      this.graphRoot.add(lines);
-    }
-
-    const pathPts = graph.path
-      .map((id) => idTo.get(id))
-      .filter(Boolean)
-      .map((n) => new Vector3(...n!.position));
-    if (pathPts.length >= 2) {
-      const curve = new CatmullRomCurve3(pathPts, false, "catmullrom", 0.15);
-      const tube = new TubeGeometry(curve, Math.max(32, pathPts.length * 8), 0.045, 7, false);
-      const glow = new Mesh(
-        tube,
-        new MeshStandardMaterial({
-          color: 0xd4b86a,
-          emissive: 0xd4b86a,
-          emissiveIntensity: 0.9,
-          roughness: 0.4,
-          transparent: true,
-          opacity: 0.92,
-          depthWrite: false,
-        }),
-      );
-      glow.material.blending = AdditiveBlending;
-      this.pathGlow = glow;
-      this.graphRoot.add(glow);
-      const haloGeo = new TubeGeometry(curve, Math.max(24, pathPts.length * 6), 0.11, 6, false);
-      const halo = new Mesh(
-        haloGeo,
-        new MeshStandardMaterial({
-          color: 0xd4b86a,
-          emissive: 0xd4b86a,
-          emissiveIntensity: 0.35,
-          transparent: true,
-          opacity: 0.22,
-          depthWrite: false,
-        }),
-      );
-      halo.material.blending = AdditiveBlending;
-      this.graphRoot.add(halo);
-    }
-    this.emit();
-  }
-
-  private clearGraph(): void {
-    for (const mesh of this.nodeMeshes) {
-      mesh.geometry.dispose();
-      this.graphRoot.remove(mesh);
-    }
-    this.nodeMeshes = [];
-    const leftover = [...this.graphRoot.children];
-    for (const ch of leftover) {
-      this.graphRoot.remove(ch);
-      const mesh = ch as Mesh;
-      mesh.geometry?.dispose?.();
-      const mat = mesh.material as Material | Material[] | undefined;
-      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
-      else mat?.dispose?.();
-    }
-    this.nodeMat?.dispose();
-    this.nodeMat = null;
-    this.pathGlow = null;
-    this.graph = null;
-  }
-
   private buildHero(): void {
-    while (this.heroRoot.children.length) {
-      const ch = this.heroRoot.children[0]!;
-      if (ch !== this.pivot) this.heroRoot.remove(ch);
-      else break;
-    }
     this.cubieMeshes = [];
     this.logical = Cube.solved(3);
-    const bodyGeo = new RoundedBoxGeometry(0.9, 0.9, 0.9, 2, 0.08);
-    const stickerGeo = new BoxGeometry(0.78, 0.78, 0.035);
+    const bodyGeo = new RoundedBoxGeometry(0.92, 0.92, 0.92, 2, 0.07);
+    const stickerGeo = new BoxGeometry(0.8, 0.8, 0.034);
     const normals: [number, number, number][] = [
       [1, 0, 0],
       [-1, 0, 0],
@@ -654,14 +437,13 @@ export class CayleyStage {
     ];
     for (const cubie of this.logical.cubies) {
       const g = new Group();
-      const body = new Mesh(bodyGeo, PLASTIC);
-      g.add(body);
+      g.add(new Mesh(bodyGeo, PLASTIC));
       const colors = cubieWorldColors(cubie);
       normals.forEach((n, i) => {
         const col = colors[i]!;
         if (col === COLOR.PLASTIC) return;
         const s = new Mesh(stickerGeo, stickerMat(col));
-        s.position.set(n[0] * 0.455, n[1] * 0.455, n[2] * 0.455);
+        s.position.set(n[0] * 0.462, n[1] * 0.462, n[2] * 0.462);
         s.lookAt(n[0] * 2, n[1] * 2, n[2] * 2);
         g.add(s);
       });
@@ -669,39 +451,179 @@ export class CayleyStage {
       this.heroRoot.add(g);
       this.cubieMeshes.push({ mesh: g, cubie });
     }
-    this.heroRoot.scale.setScalar(0.95);
+    this.heroRoot.scale.setScalar(HERO_SCALE / 3);
   }
 
   private snapHero(): void {
     const q = new Quaternion();
-    const m = new Matrix4();
     for (const { mesh, cubie } of this.cubieMeshes) {
-      const live = this.logical.cubies.find(
-        (c) =>
-          c.home[0] === cubie.home[0] &&
-          c.home[1] === cubie.home[1] &&
-          c.home[2] === cubie.home[2],
-      );
+      const live = this.liveCubie(cubie);
       if (!live) continue;
       cubie.pos = live.pos;
       cubie.rot = live.rot;
       mesh.position.set(live.pos[0], live.pos[1], live.pos[2]);
       q.setFromRotationMatrix(rotMatrix(live));
       mesh.quaternion.copy(q);
-      m.identity();
     }
   }
 
-  private placeCamera(): void {
+  private currentNode(): GraphNode | null {
+    if (!this.graph) return null;
+    const id = this.graph.walk[this.walkCursor];
+    if (!id) return this.graph.nodes[0] ?? null;
+    const idx = this.graph.idToIndex.get(id);
+    return idx === undefined ? null : this.graph.nodes[idx]!;
+  }
+
+  private placeHero(snap: boolean): void {
+    const node = this.currentNode();
+    if (!node) return;
+    this.heroTarget.set(node.x, node.y, node.z);
+    if (snap) this.heroRoot.position.copy(this.heroTarget);
+    else this.heroRoot.position.lerp(this.heroTarget, 0.14);
+    this.cursorLight.position.copy(this.heroRoot.position);
+  }
+
+  private placeCamera(dt: number): void {
     const { theta, phi, radius } = this.spherical;
-    const p = Math.min(Math.max(phi, 0.18), 1.35);
+    const p = Math.min(Math.max(phi, 0.45), 1.35);
     this.spherical.phi = p;
     this.camera.position.set(
       radius * Math.sin(p) * Math.cos(theta),
-      radius * Math.cos(p),
+      radius * Math.cos(p) * 0.85,
       radius * Math.sin(p) * Math.sin(theta),
     );
-    this.camera.lookAt(0, 0, 0);
+    const node = this.currentNode();
+    const want = node
+      ? new Vector3(node.x * 0.18, node.y * 0.18, node.z * 0.18)
+      : new Vector3();
+    this.lookTarget.lerp(want, 1 - Math.exp(-2.2 * dt));
+    this.camera.lookAt(this.lookTarget);
+  }
+
+  private clearGraphMeshes(): void {
+    for (const m of this.nodeMeshes) {
+      this.graphRoot.remove(m);
+      m.geometry.dispose();
+    }
+    this.nodeMeshes = [];
+    if (this.edgeLines) {
+      this.graphRoot.remove(this.edgeLines);
+      this.edgeLines.geometry.dispose();
+      (this.edgeLines.material as LineBasicMaterial).dispose();
+      this.edgeLines = null;
+    }
+    if (this.pathMesh) {
+      this.graphRoot.remove(this.pathMesh);
+      this.pathMesh.geometry.dispose();
+      this.pathMesh = null;
+    }
+    if (this.pathGlow) {
+      this.graphRoot.remove(this.pathGlow);
+      this.pathGlow.geometry.dispose();
+      this.pathGlow = null;
+    }
+  }
+
+  private rebuildGraphMeshes(): void {
+    this.clearGraphMeshes();
+    const graph = this.graph;
+    if (!graph) return;
+
+    for (const node of graph.nodes) {
+      const geo = buildNodeGeometry(
+        node.cube,
+        node.onPath ? PATH_SCALE : NODE_SCALE,
+      );
+      const mesh = new Mesh(geo, this.nodeMat);
+      mesh.position.set(node.x, node.y, node.z);
+      const h = Math.abs(node.x * 13 + node.y * 31 + node.z * 17);
+      mesh.rotation.set(
+        (h % 7) * 0.17,
+        (h % 11) * 0.21,
+        (h % 5) * 0.13,
+      );
+      mesh.userData.id = node.id;
+      this.graphRoot.add(mesh);
+      this.nodeMeshes.push(mesh);
+    }
+
+    const positions: number[] = [];
+    const colors: number[] = [];
+    const gray = new Color(0x5c616c);
+    const idTo = graph.idToIndex;
+    for (const e of graph.edges) {
+      if (e.onPath) continue;
+      const a = graph.nodes[idTo.get(e.from)!]!;
+      const b = graph.nodes[idTo.get(e.to)!]!;
+      const dist = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+      if (dist > 3.4) continue;
+      positions.push(a.x, a.y, a.z, b.x, b.y, b.z);
+      colors.push(gray.r, gray.g, gray.b, gray.r, gray.g, gray.b);
+    }
+    const edgeGeo = new BufferGeometry();
+    edgeGeo.setAttribute(
+      "position",
+      new BufferAttribute(new Float32Array(positions), 3),
+    );
+    edgeGeo.setAttribute(
+      "color",
+      new BufferAttribute(new Float32Array(colors), 3),
+    );
+    this.edgeLines = new LineSegments(
+      edgeGeo,
+      new LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.55,
+      }),
+    );
+    this.graphRoot.add(this.edgeLines);
+  }
+
+  private syncNodeVisibility(): void {
+    if (!this.graph) return;
+    const currentId = this.graph.walk[this.walkCursor];
+    for (const mesh of this.nodeMeshes) {
+      mesh.visible = mesh.userData.id !== currentId;
+    }
+  }
+
+  private rebuildPathTube(): void {
+    if (this.pathMesh) {
+      this.graphRoot.remove(this.pathMesh);
+      this.pathMesh.geometry.dispose();
+      this.pathMesh = null;
+    }
+    if (this.pathGlow) {
+      this.graphRoot.remove(this.pathGlow);
+      this.pathGlow.geometry.dispose();
+      this.pathGlow = null;
+    }
+    const graph = this.graph;
+    if (!graph) return;
+    const pts: Vector3[] = [];
+    const last = Math.max(this.trail, 0);
+    for (let i = 0; i <= last; i++) {
+      const id = graph.walk[i];
+      if (!id) continue;
+      const node = graph.nodes[graph.idToIndex.get(id)!];
+      if (!node) continue;
+      pts.push(new Vector3(node.x, node.y, node.z));
+    }
+    if (pts.length < 2) return;
+    const curve = new CatmullRomCurve3(pts, false, "catmullrom", 0.15);
+    const segs = Math.max(16, pts.length * 10);
+    this.pathMesh = new Mesh(
+      new TubeGeometry(curve, segs, 0.07, 10, false),
+      this.pathMat,
+    );
+    this.pathGlow = new Mesh(
+      new TubeGeometry(curve, segs, 0.2, 10, false),
+      this.glowMat,
+    );
+    this.graphRoot.add(this.pathMesh);
+    this.graphRoot.add(this.pathGlow);
   }
 
   private resize = (): void => {
@@ -715,7 +637,6 @@ export class CayleyStage {
 
   private onDown = (e: PointerEvent): void => {
     this.dragging = true;
-    this.pointerLeft = false;
     this.lastPtr.set(e.clientX, e.clientY);
     this.canvas.setPointerCapture(e.pointerId);
   };
@@ -724,20 +645,24 @@ export class CayleyStage {
     const dx = e.clientX - this.lastPtr.x;
     const dy = e.clientY - this.lastPtr.y;
     this.lastPtr.set(e.clientX, e.clientY);
-    this.spherical.theta -= dx * 0.005;
-    this.spherical.phi -= dy * 0.005;
-    this.autoOrbit = false;
+    this.spherical.theta -= dx * 0.0055;
+    this.spherical.phi -= dy * 0.0055;
   };
   private onUp = (): void => {
     this.dragging = false;
   };
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
-    this.spherical.radius = Math.min(28, Math.max(7, this.spherical.radius + e.deltaY * 0.012));
+    this.spherical.radius = Math.min(
+      26,
+      Math.max(9.2, this.spherical.radius + e.deltaY * 0.012),
+    );
   };
 
   private bind(): void {
     window.addEventListener("resize", this.resize);
+    this.ro = new ResizeObserver(() => this.resize());
+    this.ro.observe(this.canvas.parentElement ?? this.canvas);
     this.canvas.addEventListener("pointerdown", this.onDown);
     this.canvas.addEventListener("pointermove", this.onMove);
     this.canvas.addEventListener("pointerup", this.onUp);
@@ -746,6 +671,8 @@ export class CayleyStage {
   }
   private unbind(): void {
     window.removeEventListener("resize", this.resize);
+    this.ro?.disconnect();
+    this.ro = null;
     this.canvas.removeEventListener("pointerdown", this.onDown);
     this.canvas.removeEventListener("pointermove", this.onMove);
     this.canvas.removeEventListener("pointerup", this.onUp);
