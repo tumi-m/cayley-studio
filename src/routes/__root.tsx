@@ -14,9 +14,9 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "Solving a Rubik’s cube with graph theory. A 3D Cayley graph of cube states — each node a cube, each edge a turn.",
+          "A Rubik’s cube beside its Cayley graph — three concentric rings of states. Click stickers and nodes to walk the graph.",
       },
-      { name: "theme-color", content: "#050506" },
+      { name: "theme-color", content: "#f7f4ec" },
     ],
     links: [
       { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },

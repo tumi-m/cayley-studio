@@ -11,6 +11,8 @@ export const ALL_MOVES: Move[] = FACES.flatMap((f) => [
   `${f}2` as Move,
 ]);
 
+export const QTM_MOVES: Move[] = FACES.flatMap((f) => [f, `${f}'` as Move]);
+
 export const FACE_AXIS: Record<Face, { axis: 0 | 1 | 2; layer: 1 | -1 }> = {
   R: { axis: 0, layer: 1 },
   L: { axis: 0, layer: -1 },
@@ -30,14 +32,15 @@ export const FACE_RH: Record<Face, number> = {
   B: 1,
 };
 
+/** Illustrated cube palette — light plastic, sticker colours from the reference. */
 export const COLOR = {
-  U: 0xf3f1ea,
-  D: 0xe2b84c,
-  F: 0x2d9a5a,
-  B: 0x2e5aa7,
-  L: 0xde7a32,
-  R: 0xc4473a,
-  PLASTIC: 0x121214,
+  U: 0xf6f5f1,
+  D: 0xf0c33c,
+  F: 0x3a9b4a,
+  B: 0x2f62c4,
+  L: 0xe07a2f,
+  R: 0xd23b32,
+  PLASTIC: 0xe9e6df,
 } as const;
 
 export const COLOR_ID: Record<Face, number> = {
@@ -49,10 +52,23 @@ export const COLOR_ID: Record<Face, number> = {
   B: COLOR.B,
 };
 
+export const FACE_NORMAL_INDEX: Record<Face, number> = {
+  R: 0,
+  L: 1,
+  U: 2,
+  D: 3,
+  F: 4,
+  B: 5,
+};
+
 export interface Cubie {
   home: Vec3;
   pos: Vec3;
   rot: Mat3;
+}
+
+export function cssHex(n: number): string {
+  return `#${n.toString(16).padStart(6, "0")}`;
 }
 
 export function identityMat(): Mat3 {
@@ -301,15 +317,17 @@ export function cubieWorldColors(cubie: Cubie): number[] {
 export function randomScramble(n: number, rng: () => number = Math.random): Move[] {
   const moves: Move[] = [];
   let lastFace: Face | null = null;
+  let lastAxis: 0 | 1 | 2 | null = null;
   for (let i = 0; i < n; i++) {
     let move: Move;
     let face: Face;
     do {
       move = ALL_MOVES[Math.floor(rng() * ALL_MOVES.length)]!;
       face = moveFace(move);
-    } while (face === lastFace);
+    } while (face === lastFace || FACE_AXIS[face].axis === lastAxis && rng() < 0.45);
     moves.push(move);
     lastFace = face;
+    lastAxis = FACE_AXIS[face].axis;
   }
   return moves;
 }

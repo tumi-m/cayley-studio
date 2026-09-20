@@ -1,29 +1,19 @@
 import {
   ACESFilmicToneMapping,
-  AdditiveBlending,
   BoxGeometry,
-  BufferAttribute,
-  BufferGeometry,
-  CatmullRomCurve3,
   Color,
   DirectionalLight,
-  FogExp2,
   Group,
   HemisphereLight,
-  LineBasicMaterial,
-  LineSegments,
   Matrix4,
   Mesh,
-  MeshBasicMaterial,
-  MeshLambertMaterial,
   MeshPhysicalMaterial,
   PerspectiveCamera,
-  PointLight,
   Quaternion,
+  Raycaster,
   Scene,
   SRGBColorSpace,
   Timer,
-  TubeGeometry,
   Vector2,
   Vector3,
   WebGLRenderer,
@@ -33,15 +23,18 @@ import {
   COLOR,
   Cube,
   FACE_AXIS,
+  FACES,
+  cssHex,
   cubieWorldColors,
   identityMat,
+  invertMove,
   parseMove,
   rhQuarters,
   type Cubie,
+  type Face,
   type Move,
 } from "./model";
-import { buildPathGraph, type CubeGraph, type GraphNode } from "./graph";
-import { buildNodeGeometry } from "./mesh";
+import { bfsMoves, buildPathGraph, type CubeGraph } from "./graph";
 
 export interface StageSnapshot {
   playing: boolean;
@@ -51,19 +44,18 @@ export interface StageSnapshot {
   nodes: number;
   step: number;
   total: number;
+  canUndo: boolean;
+  hint: string;
 }
 
-const VOID = 0x050506;
-const NODE_SCALE = 1.28;
-const PATH_SCALE = 1.38;
-const HERO_SCALE = 1.72;
+const BG = 0xf7f4ec;
 
 const PLASTIC = new MeshPhysicalMaterial({
   color: COLOR.PLASTIC,
-  roughness: 0.42,
-  metalness: 0.08,
-  clearcoat: 0.28,
-  clearcoatRoughness: 0.45,
+  roughness: 0.55,
+  metalness: 0.02,
+  clearcoat: 0.18,
+  clearcoatRoughness: 0.55,
 });
 
 const stickerCache = new Map<number, MeshPhysicalMaterial>();
@@ -72,10 +64,10 @@ function stickerMat(hex: number): MeshPhysicalMaterial {
   if (!m) {
     m = new MeshPhysicalMaterial({
       color: hex,
-      roughness: 0.28,
-      metalness: 0.02,
-      clearcoat: 0.55,
-      clearcoatRoughness: 0.22,
+      roughness: 0.38,
+      metalness: 0,
+      clearcoat: 0.22,
+      clearcoatRoughness: 0.4,
     });
     stickerCache.set(hex, m);
   }
@@ -108,41 +100,46 @@ function rotMatrix(cubie: Cubie): Matrix4 {
   );
 }
 
+function worldFaceFromNormal(n: Vector3): Face {
+  const ax = Math.abs(n.x);
+  const ay = Math.abs(n.y);
+  const az = Math.abs(n.z);
+  if (ax >= ay && ax >= az) return n.x >= 0 ? "R" : "L";
+  if (ay >= ax && ay >= az) return n.y >= 0 ? "U" : "D";
+  return n.z >= 0 ? "F" : "B";
+}
+
 export class CayleyStage {
-  readonly canvas: HTMLCanvasElement;
+  readonly cubeCanvas: HTMLCanvasElement;
+  readonly graphCanvas: HTMLCanvasElement;
   onChange: ((snap: StageSnapshot) => void) | null = null;
 
   private renderer: WebGLRenderer;
   private scene: Scene;
   private camera: PerspectiveCamera;
+  private graphCtx: CanvasRenderingContext2D | null;
   private timer = new Timer();
   private raf = 0;
   private disposed = false;
-
-  private graphRoot = new Group();
-  private nodeMeshes: Mesh[] = [];
-  private nodeMat: MeshLambertMaterial;
-  private edgeLines: LineSegments | null = null;
-  private pathMesh: Mesh | null = null;
-  private pathGlow: Mesh | null = null;
-  private pathMat: MeshBasicMaterial;
-  private glowMat: MeshBasicMaterial;
-  private cursorLight: PointLight;
+  private raycaster = new Raycaster();
+  private ndc = new Vector2();
+  private hitN = new Vector3();
 
   private heroRoot = new Group();
   private pivot = new Group();
   private cubieMeshes: { mesh: Group; cubie: Cubie }[] = [];
+  private stickerMeshes: Mesh[] = [];
   private logical = Cube.solved(3);
-  private heroTarget = new Vector3();
-  private lookTarget = new Vector3();
 
   private graph: CubeGraph | null = null;
   private walkCursor = 0;
   private trail = 0;
-  private phase: "scramble" | "solve" | "hold" = "hold";
+  private phase: "scramble" | "solve" | "hold" | "user" = "hold";
   private holdLeft = 0;
   private queue: Move[] = [];
-  private queueKind: "scramble" | "solve" = "scramble";
+  private queueKind: "scramble" | "solve" | "user" = "scramble";
+  private history: Move[] = [];
+  private hoverId: string | null = null;
 
   private anim: {
     axis: "x" | "y" | "z";
@@ -153,10 +150,17 @@ export class CayleyStage {
     move: Move;
   } | null = null;
 
-  private spherical = { theta: 0.62, phi: 1.08, radius: 12.4 };
+  private spherical = { theta: 0.72, phi: 0.98, radius: 6.35 };
   private dragging = false;
+  private dragMoved = false;
   private lastPtr = new Vector2();
-  private reduceMotion = false;
+  private graphPan = { x: 0, y: 0, scale: 1 };
+  private graphDrag: {
+    x: number;
+    y: number;
+    panX: number;
+    panY: number;
+  } | null = null;
   private ro: ResizeObserver | null = null;
 
   speed = 1;
@@ -165,60 +169,36 @@ export class CayleyStage {
   moveLabel = "";
   phaseLabel = "Loading";
 
-  constructor(canvas: HTMLCanvasElement) {
-    this.canvas = canvas;
-    this.reduceMotion = window.matchMedia(
-      "(prefers-reduced-motion: reduce)",
-    ).matches;
+  constructor(cubeCanvas: HTMLCanvasElement, graphCanvas: HTMLCanvasElement) {
+    this.cubeCanvas = cubeCanvas;
+    this.graphCanvas = graphCanvas;
+    this.graphCtx = graphCanvas.getContext("2d");
 
     this.renderer = new WebGLRenderer({
-      canvas,
+      canvas: cubeCanvas,
       antialias: true,
       alpha: false,
       powerPreference: "high-performance",
-      preserveDrawingBuffer: true,
     });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    this.renderer.setClearColor(VOID, 1);
+    this.renderer.setClearColor(BG, 1);
     this.renderer.toneMapping = ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
+    this.renderer.toneMappingExposure = 1.12;
     this.renderer.outputColorSpace = SRGBColorSpace;
 
     this.scene = new Scene();
-    this.scene.background = new Color(VOID);
-    this.scene.fog = new FogExp2(VOID, 0.016);
-    this.camera = new PerspectiveCamera(38, 1, 0.1, 120);
+    this.scene.background = new Color(BG);
+    this.camera = new PerspectiveCamera(32, 1, 0.1, 80);
 
-    this.scene.add(new HemisphereLight(0xb8c4d8, 0x0a0a0c, 0.85));
-    const key = new DirectionalLight(0xfff4e8, 1.55);
-    key.position.set(8, 14, 6);
+    this.scene.add(new HemisphereLight(0xfffbf3, 0xd9d2c4, 1.15));
+    const key = new DirectionalLight(0xfffaf2, 1.15);
+    key.position.set(4.5, 8, 5.5);
     this.scene.add(key);
-    const fill = new DirectionalLight(0x6a7a99, 0.35);
-    fill.position.set(-10, 4, -8);
+    const fill = new DirectionalLight(0xe8eef8, 0.45);
+    fill.position.set(-6, 2, -3);
     this.scene.add(fill);
-    const rim = new DirectionalLight(0xffd9a0, 0.28);
-    rim.position.set(0, -6, 10);
-    this.scene.add(rim);
-
-    this.nodeMat = new MeshLambertMaterial({ vertexColors: true });
-    this.pathMat = new MeshBasicMaterial({
-      color: 0xffc56a,
-      transparent: true,
-      opacity: 0.95,
-    });
-    this.glowMat = new MeshBasicMaterial({
-      color: 0xff9a3a,
-      transparent: true,
-      opacity: 0.22,
-      blending: AdditiveBlending,
-      depthWrite: false,
-    });
-
-    this.cursorLight = new PointLight(0xffc56a, 2.4, 6.5, 1.6);
-    this.scene.add(this.cursorLight);
 
     this.heroRoot.add(this.pivot);
-    this.scene.add(this.graphRoot);
     this.scene.add(this.heroRoot);
     this.buildHero();
     this.resize();
@@ -237,6 +217,7 @@ export class CayleyStage {
       const dt = Math.min(this.timer.getDelta(), 0.1);
       this.tick(dt);
       this.renderer.render(this.scene, this.camera);
+      this.drawGraph();
     };
     this.raf = requestAnimationFrame(loop);
   }
@@ -245,7 +226,6 @@ export class CayleyStage {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.unbind();
-    this.clearGraphMeshes();
     this.renderer.dispose();
   }
 
@@ -253,15 +233,12 @@ export class CayleyStage {
     this.anim = null;
     this.pivot.rotation.set(0, 0, 0);
     this.queue = [];
+    this.history = [];
     const s = seed ?? (Math.random() * 0xffffffff) >>> 0;
-    this.graph = buildPathGraph(s, 12);
-    this.rebuildGraphMeshes();
+    this.graph = buildPathGraph(s, 10);
     this.resetLogical();
     this.walkCursor = 0;
     this.trail = 0;
-    this.placeHero(true);
-    this.syncNodeVisibility();
-    this.rebuildPathTube();
     this.beginScramble();
     this.emit();
   }
@@ -275,6 +252,62 @@ export class CayleyStage {
     this.emit();
   }
 
+  applyMove(move: Move): void {
+    this.playing = false;
+    this.phase = "user";
+    this.phaseLabel = "Turn";
+    this.queueKind = "user";
+    if (this.anim) this.queue.push(move);
+    else this.beginMove(move);
+    this.emit();
+  }
+
+  undo(): void {
+    if (this.anim || !this.history.length) return;
+    this.playing = false;
+    this.phase = "user";
+    this.queueKind = "user";
+    const last = this.history.pop()!;
+    this.beginMove(invertMove(last), true);
+    this.emit();
+  }
+
+  resetSolved(): void {
+    this.anim = null;
+    this.pivot.rotation.set(0, 0, 0);
+    this.queue = [];
+    this.history = [];
+    this.playing = false;
+    this.resetLogical();
+    this.walkCursor = 0;
+    this.trail = 0;
+    this.phase = "hold";
+    this.phaseLabel = "Solved";
+    this.moveLabel = "";
+    this.emit();
+  }
+
+  goToNode(id: string): void {
+    if (!this.graph) return;
+    const from = this.logical.key();
+    const start = this.graph.idToIndex.has(from) ? from : this.graph.walk[0]!;
+    if (start !== from) {
+      this.resetLogical();
+      this.history = [];
+    }
+    const moves = bfsMoves(this.graph, start, id);
+    if (!moves || !moves.length) {
+      if (start === id) this.emit();
+      return;
+    }
+    this.playing = true;
+    this.phase = "user";
+    this.queueKind = "user";
+    this.queue = moves.slice();
+    this.phaseLabel = "Walk";
+    this.emit();
+  }
+
   snapshot(): StageSnapshot {
     return {
       playing: this.playing,
@@ -284,6 +317,8 @@ export class CayleyStage {
       nodes: this.graph?.nodes.length ?? 0,
       step: this.trail,
       total: Math.max((this.graph?.walk.length ?? 1) - 1, 0),
+      canUndo: this.history.length > 0 && !this.anim,
+      hint: this.hoverId ? "Walk to this state" : "Click a sticker or a node",
     };
   }
 
@@ -311,17 +346,16 @@ export class CayleyStage {
   }
 
   private tick(dt: number): void {
-    if (!this.dragging && !this.reduceMotion) {
-      this.spherical.theta += dt * 0.12;
+    this.placeCamera();
+    if (this.anim) {
+      if (this.playing || this.queueKind === "user") this.stepAnim(dt);
+      return;
     }
-    this.placeHero(false);
-    this.placeCamera(dt);
-
-    if (!this.playing) return;
+    if (!this.playing && !(this.queueKind === "user" && this.queue.length)) return;
 
     if (this.phase === "hold") {
       this.holdLeft -= dt;
-      if (this.holdLeft <= 0) {
+      if (this.holdLeft <= 0 && this.playing) {
         if (this.walkCursor <= 0) this.beginScramble();
         else this.beginSolve();
       }
@@ -340,7 +374,7 @@ export class CayleyStage {
 
     if (this.phase === "scramble") {
       this.phase = "hold";
-      this.holdLeft = 0.9;
+      this.holdLeft = 0.7;
       this.phaseLabel = "Path";
       this.emit();
       return;
@@ -350,16 +384,22 @@ export class CayleyStage {
       this.resetLogical();
       this.walkCursor = 0;
       this.trail = 0;
-      this.syncNodeVisibility();
-      this.rebuildPathTube();
+      this.history = [];
       this.phase = "hold";
-      this.holdLeft = 1.15;
+      this.holdLeft = 1;
       this.phaseLabel = "Solved";
+      this.emit();
+      return;
+    }
+
+    if (this.phase === "user") {
+      this.phaseLabel = "Ready";
+      this.playing = false;
       this.emit();
     }
   }
 
-  private beginMove(move: Move): void {
+  private beginMove(move: Move, undoing = false): void {
     const { face, turns } = parseMove(move);
     const { axis, layer } = FACE_AXIS[face];
     const k = rhQuarters(move);
@@ -372,9 +412,10 @@ export class CayleyStage {
       this.pivot.attach(mesh);
       members.push(mesh);
     }
-    const duration = (turns === 2 ? 0.72 : 0.52) / this.speed;
+    const duration = (turns === 2 ? 0.55 : 0.38) / this.speed;
     this.anim = { axis: ax, angle, t: 0, duration, members, move };
     this.moveLabel = move;
+    if (!undoing && this.queueKind === "user") this.history.push(move);
     this.emit();
   }
 
@@ -388,20 +429,16 @@ export class CayleyStage {
     this.pivot.rotation.set(0, 0, 0);
     this.logical.apply(this.anim.move);
     this.snapHero();
-    if (this.queueKind === "scramble") {
-      this.walkCursor = Math.min(
-        this.walkCursor + 1,
-        (this.graph?.walk.length ?? 1) - 1,
-      );
-      this.trail = this.walkCursor;
-    } else {
-      this.walkCursor = Math.max(this.walkCursor - 1, 0);
-      this.trail = Math.max(this.trail, this.walkCursor);
+    const key = this.logical.key();
+    if (this.graph) {
+      const w = this.graph.walk.indexOf(key);
+      if (w >= 0) {
+        this.walkCursor = w;
+        this.trail = Math.max(this.trail, w);
+      }
     }
     this.anim = null;
     this.moveLabel = "";
-    this.syncNodeVisibility();
-    this.rebuildPathTube();
     this.emit();
   }
 
@@ -424,9 +461,10 @@ export class CayleyStage {
 
   private buildHero(): void {
     this.cubieMeshes = [];
+    this.stickerMeshes = [];
     this.logical = Cube.solved(3);
-    const bodyGeo = new RoundedBoxGeometry(0.92, 0.92, 0.92, 2, 0.07);
-    const stickerGeo = new BoxGeometry(0.8, 0.8, 0.034);
+    const bodyGeo = new RoundedBoxGeometry(0.94, 0.94, 0.94, 3, 0.1);
+    const stickerGeo = new RoundedBoxGeometry(0.74, 0.74, 0.05, 2, 0.13);
     const normals: [number, number, number][] = [
       [1, 0, 0],
       [-1, 0, 0],
@@ -435,6 +473,7 @@ export class CayleyStage {
       [0, 0, 1],
       [0, 0, -1],
     ];
+    const faces: Face[] = ["R", "L", "U", "D", "F", "B"];
     for (const cubie of this.logical.cubies) {
       const g = new Group();
       g.add(new Mesh(bodyGeo, PLASTIC));
@@ -443,15 +482,16 @@ export class CayleyStage {
         const col = colors[i]!;
         if (col === COLOR.PLASTIC) return;
         const s = new Mesh(stickerGeo, stickerMat(col));
-        s.position.set(n[0] * 0.462, n[1] * 0.462, n[2] * 0.462);
+        s.position.set(n[0] * 0.47, n[1] * 0.47, n[2] * 0.47);
         s.lookAt(n[0] * 2, n[1] * 2, n[2] * 2);
+        s.userData.face = faces[i];
         g.add(s);
+        this.stickerMeshes.push(s);
       });
       g.position.set(cubie.pos[0], cubie.pos[1], cubie.pos[2]);
       this.heroRoot.add(g);
       this.cubieMeshes.push({ mesh: g, cubie });
     }
-    this.heroRoot.scale.setScalar(HERO_SCALE / 3);
   }
 
   private snapHero(): void {
@@ -467,216 +507,285 @@ export class CayleyStage {
     }
   }
 
-  private currentNode(): GraphNode | null {
-    if (!this.graph) return null;
-    const id = this.graph.walk[this.walkCursor];
-    if (!id) return this.graph.nodes[0] ?? null;
-    const idx = this.graph.idToIndex.get(id);
-    return idx === undefined ? null : this.graph.nodes[idx]!;
-  }
-
-  private placeHero(snap: boolean): void {
-    const node = this.currentNode();
-    if (!node) return;
-    this.heroTarget.set(node.x, node.y, node.z);
-    if (snap) this.heroRoot.position.copy(this.heroTarget);
-    else this.heroRoot.position.lerp(this.heroTarget, 0.14);
-    this.cursorLight.position.copy(this.heroRoot.position);
-  }
-
-  private placeCamera(dt: number): void {
+  private placeCamera(): void {
     const { theta, phi, radius } = this.spherical;
-    const p = Math.min(Math.max(phi, 0.45), 1.35);
+    const p = Math.min(Math.max(phi, 0.4), 1.28);
     this.spherical.phi = p;
     this.camera.position.set(
       radius * Math.sin(p) * Math.cos(theta),
-      radius * Math.cos(p) * 0.85,
+      radius * Math.cos(p),
       radius * Math.sin(p) * Math.sin(theta),
     );
-    const node = this.currentNode();
-    const want = node
-      ? new Vector3(node.x * 0.18, node.y * 0.18, node.z * 0.18)
-      : new Vector3();
-    this.lookTarget.lerp(want, 1 - Math.exp(-2.2 * dt));
-    this.camera.lookAt(this.lookTarget);
+    this.camera.lookAt(0, -0.08, 0);
   }
 
-  private clearGraphMeshes(): void {
-    for (const m of this.nodeMeshes) {
-      this.graphRoot.remove(m);
-      m.geometry.dispose();
-    }
-    this.nodeMeshes = [];
-    if (this.edgeLines) {
-      this.graphRoot.remove(this.edgeLines);
-      this.edgeLines.geometry.dispose();
-      (this.edgeLines.material as LineBasicMaterial).dispose();
-      this.edgeLines = null;
-    }
-    if (this.pathMesh) {
-      this.graphRoot.remove(this.pathMesh);
-      this.pathMesh.geometry.dispose();
-      this.pathMesh = null;
-    }
-    if (this.pathGlow) {
-      this.graphRoot.remove(this.pathGlow);
-      this.pathGlow.geometry.dispose();
-      this.pathGlow = null;
-    }
+  private currentId(): string | null {
+    return this.logical.key();
   }
 
-  private rebuildGraphMeshes(): void {
-    this.clearGraphMeshes();
+  private drawGraph(): void {
+    const ctx = this.graphCtx;
+    const canvas = this.graphCanvas;
     const graph = this.graph;
-    if (!graph) return;
+    if (!ctx || !graph) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = canvas.clientWidth;
+    const h = canvas.clientHeight;
+    if (w < 2 || h < 2) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#f7f4ec";
+    ctx.fillRect(0, 0, w, h);
 
-    for (const node of graph.nodes) {
-      const geo = buildNodeGeometry(
-        node.cube,
-        node.onPath ? PATH_SCALE : NODE_SCALE,
-      );
-      const mesh = new Mesh(geo, this.nodeMat);
-      mesh.position.set(node.x, node.y, node.z);
-      const h = Math.abs(node.x * 13 + node.y * 31 + node.z * 17);
-      mesh.rotation.set(
-        (h % 7) * 0.17,
-        (h % 11) * 0.21,
-        (h % 5) * 0.13,
-      );
-      mesh.userData.id = node.id;
-      this.graphRoot.add(mesh);
-      this.nodeMeshes.push(mesh);
+    const fit = Math.min(w, h) * 0.5 * this.graphPan.scale;
+    ctx.save();
+    ctx.translate(w / 2 + this.graphPan.x, h / 2 + this.graphPan.y);
+    ctx.scale(fit, fit);
+
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const rings = [0.3, 0.56, 0.82];
+    ctx.strokeStyle = "rgba(70, 66, 60, 0.22)";
+    ctx.lineWidth = 0.012;
+    for (const r of rings) {
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.stroke();
     }
 
-    const positions: number[] = [];
-    const colors: number[] = [];
-    const gray = new Color(0x5c616c);
-    const idTo = graph.idToIndex;
-    for (const e of graph.edges) {
-      if (e.onPath) continue;
-      const a = graph.nodes[idTo.get(e.from)!]!;
-      const b = graph.nodes[idTo.get(e.to)!]!;
-      const dist = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
-      if (dist > 3.4) continue;
-      positions.push(a.x, a.y, a.z, b.x, b.y, b.z);
-      colors.push(gray.r, gray.g, gray.b, gray.r, gray.g, gray.b);
-    }
-    const edgeGeo = new BufferGeometry();
-    edgeGeo.setAttribute(
-      "position",
-      new BufferAttribute(new Float32Array(positions), 3),
-    );
-    edgeGeo.setAttribute(
-      "color",
-      new BufferAttribute(new Float32Array(colors), 3),
-    );
-    this.edgeLines = new LineSegments(
-      edgeGeo,
-      new LineBasicMaterial({
-        vertexColors: true,
-        transparent: true,
-        opacity: 0.55,
-      }),
-    );
-    this.graphRoot.add(this.edgeLines);
-  }
+    const current = this.currentId();
+    const hover = this.hoverId;
 
-  private syncNodeVisibility(): void {
-    if (!this.graph) return;
-    const currentId = this.graph.walk[this.walkCursor];
-    for (const mesh of this.nodeMeshes) {
-      mesh.visible = mesh.userData.id !== currentId;
+    if (hover) {
+      ctx.strokeStyle = "rgba(70, 66, 60, 0.28)";
+      ctx.lineWidth = 0.01;
+      ctx.beginPath();
+      for (const nb of graph.adj.get(hover) ?? []) {
+        const a = graph.nodes[graph.idToIndex.get(hover)!];
+        const b = graph.nodes[graph.idToIndex.get(nb.id)!];
+        if (!a || !b) continue;
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+      }
+      ctx.stroke();
     }
-  }
 
-  private rebuildPathTube(): void {
-    if (this.pathMesh) {
-      this.graphRoot.remove(this.pathMesh);
-      this.pathMesh.geometry.dispose();
-      this.pathMesh = null;
-    }
-    if (this.pathGlow) {
-      this.graphRoot.remove(this.pathGlow);
-      this.pathGlow.geometry.dispose();
-      this.pathGlow = null;
-    }
-    const graph = this.graph;
-    if (!graph) return;
-    const pts: Vector3[] = [];
+    ctx.strokeStyle = "#2a2926";
+    ctx.lineWidth = 0.028;
+    ctx.beginPath();
     const last = Math.max(this.trail, 0);
-    for (let i = 0; i <= last; i++) {
-      const id = graph.walk[i];
-      if (!id) continue;
-      const node = graph.nodes[graph.idToIndex.get(id)!];
-      if (!node) continue;
-      pts.push(new Vector3(node.x, node.y, node.z));
+    for (let i = 0; i < last; i++) {
+      const a = graph.nodes[graph.idToIndex.get(graph.walk[i]!)!];
+      const b = graph.nodes[graph.idToIndex.get(graph.walk[i + 1]!)!];
+      if (!a || !b) continue;
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
     }
-    if (pts.length < 2) return;
-    const curve = new CatmullRomCurve3(pts, false, "catmullrom", 0.15);
-    const segs = Math.max(16, pts.length * 10);
-    this.pathMesh = new Mesh(
-      new TubeGeometry(curve, segs, 0.07, 10, false),
-      this.pathMat,
-    );
-    this.pathGlow = new Mesh(
-      new TubeGeometry(curve, segs, 0.2, 10, false),
-      this.glowMat,
-    );
-    this.graphRoot.add(this.pathMesh);
-    this.graphRoot.add(this.pathGlow);
+    ctx.stroke();
+
+    const rNode = 0.064;
+    for (const node of graph.nodes) {
+      const isCurrent = node.id === current;
+      const isHover = node.id === hover;
+      const rad = isCurrent ? rNode * 1.55 : isHover ? rNode * 1.28 : rNode;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, rad, 0, Math.PI * 2);
+      ctx.fillStyle = cssHex(node.color);
+      ctx.fill();
+      ctx.lineWidth = isCurrent ? 0.014 : 0.007;
+      ctx.strokeStyle = isCurrent ? "#1c1b18" : "rgba(28, 27, 24, 0.35)";
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  private graphHit(e: PointerEvent): string | null {
+    const graph = this.graph;
+    const canvas = this.graphCanvas;
+    if (!graph) return null;
+    const rect = canvas.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    const fit = Math.min(w, h) * 0.5 * this.graphPan.scale;
+    const x = (e.clientX - rect.left - w / 2 - this.graphPan.x) / fit;
+    const y = (e.clientY - rect.top - h / 2 - this.graphPan.y) / fit;
+    let best: string | null = null;
+    let bestD = 0.09;
+    for (const node of graph.nodes) {
+      const d = Math.hypot(node.x - x, node.y - y);
+      if (d < bestD) {
+        bestD = d;
+        best = node.id;
+      }
+    }
+    return best;
   }
 
   private resize = (): void => {
-    const parent = this.canvas.parentElement;
-    const w = parent?.clientWidth || window.innerWidth;
-    const h = parent?.clientHeight || window.innerHeight;
-    this.camera.aspect = w / Math.max(h, 1);
+    const cubeParent = this.cubeCanvas.parentElement;
+    const graphParent = this.graphCanvas.parentElement;
+    const cw = cubeParent?.clientWidth || window.innerWidth / 2;
+    const ch = cubeParent?.clientHeight || window.innerHeight;
+    this.camera.aspect = cw / Math.max(ch, 1);
     this.camera.updateProjectionMatrix();
-    this.renderer.setSize(w, h, false);
+    this.renderer.setSize(cw, ch, false);
+
+    const gw = graphParent?.clientWidth || window.innerWidth / 2;
+    const gh = graphParent?.clientHeight || window.innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.graphCanvas.width = Math.max(1, Math.floor(gw * dpr));
+    this.graphCanvas.height = Math.max(1, Math.floor(gh * dpr));
+    this.graphCanvas.style.width = `${gw}px`;
+    this.graphCanvas.style.height = `${gh}px`;
   };
 
   private onDown = (e: PointerEvent): void => {
     this.dragging = true;
+    this.dragMoved = false;
     this.lastPtr.set(e.clientX, e.clientY);
-    this.canvas.setPointerCapture(e.pointerId);
+    this.cubeCanvas.setPointerCapture(e.pointerId);
   };
   private onMove = (e: PointerEvent): void => {
     if (!this.dragging) return;
     const dx = e.clientX - this.lastPtr.x;
     const dy = e.clientY - this.lastPtr.y;
+    if (Math.hypot(dx, dy) > 3) this.dragMoved = true;
     this.lastPtr.set(e.clientX, e.clientY);
-    this.spherical.theta -= dx * 0.0055;
-    this.spherical.phi -= dy * 0.0055;
+    this.spherical.theta -= dx * 0.007;
+    this.spherical.phi -= dy * 0.007;
   };
-  private onUp = (): void => {
+  private onUp = (e: PointerEvent): void => {
+    if (!this.dragMoved) this.clickCube(e);
     this.dragging = false;
+    this.dragMoved = false;
   };
+  private clickCube(e: PointerEvent): void {
+    const rect = this.cubeCanvas.getBoundingClientRect();
+    this.ndc.set(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    this.raycaster.setFromCamera(this.ndc, this.camera);
+    const hits = this.raycaster.intersectObjects(this.stickerMeshes, false);
+    const hit = hits[0];
+    if (!hit?.face) return;
+    this.hitN.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+    const face = worldFaceFromNormal(this.hitN);
+    const move: Move = e.shiftKey ? (`${face}'` as Move) : face;
+    this.applyMove(move);
+  }
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
     this.spherical.radius = Math.min(
-      26,
-      Math.max(9.2, this.spherical.radius + e.deltaY * 0.012),
+      11,
+      Math.max(4.6, this.spherical.radius + e.deltaY * 0.01),
     );
+  };
+
+  private onGraphDown = (e: PointerEvent): void => {
+    this.graphDrag = {
+      x: e.clientX,
+      y: e.clientY,
+      panX: this.graphPan.x,
+      panY: this.graphPan.y,
+    };
+    this.graphCanvas.setPointerCapture(e.pointerId);
+  };
+  private onGraphMove = (e: PointerEvent): void => {
+    const id = this.graphHit(e);
+    if (id !== this.hoverId) {
+      this.hoverId = id;
+      this.graphCanvas.style.cursor = id ? "pointer" : "grab";
+      this.emit();
+    }
+    if (!this.graphDrag) return;
+    const dx = e.clientX - this.graphDrag.x;
+    const dy = e.clientY - this.graphDrag.y;
+    this.graphPan.x = this.graphDrag.panX + dx;
+    this.graphPan.y = this.graphDrag.panY + dy;
+  };
+  private onGraphUp = (e: PointerEvent): void => {
+    const dragged =
+      this.graphDrag &&
+      Math.hypot(e.clientX - this.graphDrag.x, e.clientY - this.graphDrag.y) > 6;
+    this.graphDrag = null;
+    if (dragged) return;
+    const id = this.graphHit(e);
+    if (id) this.goToNode(id);
+  };
+  private onGraphLeave = (): void => {
+    if (this.hoverId) {
+      this.hoverId = null;
+      this.emit();
+    }
+  };
+  private onGraphWheel = (e: WheelEvent): void => {
+    e.preventDefault();
+    this.graphPan.scale = Math.min(
+      2.2,
+      Math.max(0.6, this.graphPan.scale * (e.deltaY > 0 ? 0.92 : 1.08)),
+    );
+  };
+
+  private onKey = (e: KeyboardEvent): void => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (e.code === "Space") {
+      e.preventDefault();
+      this.setPlaying(!this.playing);
+      return;
+    }
+    if (e.code === "KeyZ" && e.shiftKey === false) {
+      e.preventDefault();
+      this.undo();
+      return;
+    }
+    const letter = e.key.toUpperCase();
+    if (!(FACES as string[]).includes(letter)) return;
+    e.preventDefault();
+    const face = letter as Face;
+    const move: Move = e.shiftKey ? (`${face}'` as Move) : face;
+    this.applyMove(move);
   };
 
   private bind(): void {
     window.addEventListener("resize", this.resize);
+    window.addEventListener("keydown", this.onKey);
     this.ro = new ResizeObserver(() => this.resize());
-    this.ro.observe(this.canvas.parentElement ?? this.canvas);
-    this.canvas.addEventListener("pointerdown", this.onDown);
-    this.canvas.addEventListener("pointermove", this.onMove);
-    this.canvas.addEventListener("pointerup", this.onUp);
-    this.canvas.addEventListener("pointercancel", this.onUp);
-    this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
+    this.ro.observe(this.cubeCanvas.parentElement ?? this.cubeCanvas);
+    this.ro.observe(this.graphCanvas.parentElement ?? this.graphCanvas);
+    this.cubeCanvas.addEventListener("pointerdown", this.onDown);
+    this.cubeCanvas.addEventListener("pointermove", this.onMove);
+    this.cubeCanvas.addEventListener("pointerup", this.onUp);
+    this.cubeCanvas.addEventListener("pointercancel", this.onUp);
+    this.cubeCanvas.addEventListener("wheel", this.onWheel, { passive: false });
+    this.graphCanvas.addEventListener("pointerdown", this.onGraphDown);
+    this.graphCanvas.addEventListener("pointermove", this.onGraphMove);
+    this.graphCanvas.addEventListener("pointerup", this.onGraphUp);
+    this.graphCanvas.addEventListener("pointercancel", this.onGraphUp);
+    this.graphCanvas.addEventListener("pointerleave", this.onGraphLeave);
+    this.graphCanvas.addEventListener("wheel", this.onGraphWheel, {
+      passive: false,
+    });
   }
   private unbind(): void {
     window.removeEventListener("resize", this.resize);
+    window.removeEventListener("keydown", this.onKey);
     this.ro?.disconnect();
     this.ro = null;
-    this.canvas.removeEventListener("pointerdown", this.onDown);
-    this.canvas.removeEventListener("pointermove", this.onMove);
-    this.canvas.removeEventListener("pointerup", this.onUp);
-    this.canvas.removeEventListener("pointercancel", this.onUp);
-    this.canvas.removeEventListener("wheel", this.onWheel);
+    this.cubeCanvas.removeEventListener("pointerdown", this.onDown);
+    this.cubeCanvas.removeEventListener("pointermove", this.onMove);
+    this.cubeCanvas.removeEventListener("pointerup", this.onUp);
+    this.cubeCanvas.removeEventListener("pointercancel", this.onUp);
+    this.cubeCanvas.removeEventListener("wheel", this.onWheel);
+    this.graphCanvas.removeEventListener("pointerdown", this.onGraphDown);
+    this.graphCanvas.removeEventListener("pointermove", this.onGraphMove);
+    this.graphCanvas.removeEventListener("pointerup", this.onGraphUp);
+    this.graphCanvas.removeEventListener("pointercancel", this.onGraphUp);
+    this.graphCanvas.removeEventListener("pointerleave", this.onGraphLeave);
+    this.graphCanvas.removeEventListener("wheel", this.onGraphWheel);
   }
 }

@@ -1,16 +1,16 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #050506;
-  --color-elevated: #16161a;
-  --color-surface: #1c1c22;
-  --color-fg: #ece8df;
-  --color-muted: #9a958c;
-  --color-dim: #6f6b64;
+  --color-bg: #f7f4ec;
+  --color-elevated: #fffcf5;
+  --color-surface: #ebe6da;
+  --color-fg: #1c1b18;
+  --color-muted: #6d685e;
+  --color-dim: #9a9488;
   --color-border: color-mix(in oklab, var(--color-fg) 14%, transparent);
-  --color-accent: #c8ccd4;
-  --color-accent-fg: #050506;
-  --color-ring: #c8ccd4;
+  --color-accent: #1c1b18;
+  --color-accent-fg: #f7f4ec;
+  --color-ring: #1c1b18;
   --font-sans: "Outfit", system-ui, sans-serif;
   --font-display: "Fraunces", "Times New Roman", serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
@@ -54,15 +54,23 @@
     text-wrap: pretty;
   }
 
-  .stage-vignette {
-    pointer-events: none;
-    position: absolute;
-    inset: 0;
-    background: radial-gradient(
-      ellipse at 50% 46%,
-      transparent 38%,
-      color-mix(in oklab, var(--color-bg) 72%, transparent) 100%
-    );
+  .stage-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);
+    height: 100dvh;
+    min-height: 100dvh;
+    padding: 5rem 1.25rem 6.25rem;
+    gap: 0.5rem;
+    background: var(--color-bg);
+  }
+
+  @media (max-width: 720px) {
+    .stage-grid {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, 0.44fr) minmax(0, 0.56fr);
+      padding: 4.5rem 0.6rem 8.25rem;
+      gap: 0;
+    }
   }
 
   @media (prefers-reduced-motion: reduce) {

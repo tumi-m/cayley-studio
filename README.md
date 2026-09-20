@@ -1,27 +1,19 @@
 # Cayley
 
-A cinematic 3D studio for Rubik’s-cube graph theory — the cube is a graph.
+A Rubik’s cube on the left. Its Cayley graph on the right, drawn as three concentric rings.
 
-Each node is a cube state. Each edge is a face turn. The gold path is a route home: a geodesic on the Cayley graph of the cube group.
+Each coloured node is a cube state. Each step along the dark path is a face turn. Click a sticker to turn the cube, or click a node to walk there.
 
-Inspired by [The Math Flow’s graph-theory solve](https://x.com/TheMathFlow/status/2101154346583154801).
+Inspired by [The Math Flow](https://x.com/TheMathFlow/status/2101154346583154801).
 
-## What it does
+## Controls
 
-- **Live WebGL constellation** — dozens of physical 3×3 cubes floating in a void, each a reachable state
-- **Gold geodesic** — the scramble/solve path drawn as a glowing tube through the graph
-- **Orbit** — slow cinematic camera; drag to look, scroll to zoom
-- **New path** — another random walk and its reverse-solve
-
-The 3×3 cube group has 43,252,003,274,489,856,000 reachable states. God’s number is 20. This stage shows a local chart of that graph, not the whole thing.
+- **Drag the cube** to orbit
+- **Click a sticker** to turn that face (Shift = prime)
+- **U R F D L B** on the keyboard (Shift for counterclockwise)
+- **Click a node** on the rings to BFS-walk to that state
+- **Undo / Reset / New path / Play**
 
 ## Stack
 
-TanStack Start, React, Three.js, Tailwind. No accounts. Graph search runs in the browser.
-
-## Run
-
-```bash
-npm install
-npm run dev
-```
+TanStack Start, React, Three.js, Tailwind. No accounts. The graph is a local chart of the cube group, not all 43 quintillion states.
