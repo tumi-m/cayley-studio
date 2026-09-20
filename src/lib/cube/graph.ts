@@ -37,8 +37,8 @@ export interface CubeGraph {
   adj: Map<string, { id: string; move: Move }[]>;
 }
 
-const NODE_CAP = 64;
-const RING_R = [0.3, 0.56, 0.82] as const;
+const NODE_CAP = 72;
+export const RING_R = [0.32, 0.58, 0.84] as const;
 const NODE_PALETTE = [COLOR.U, COLOR.D, COLOR.F, COLOR.B, COLOR.L, COLOR.R];
 
 function hash32(s: string): number {
@@ -237,26 +237,21 @@ function layoutRings(
 
   uniqueWalk.forEach((id, i) => {
     const t = i / Math.max(nPath - 1, 1);
-    const angle = -2.45 + t * 4.55;
+    const angle = -2.55 + t * 4.2;
     const r = RING_R[2];
     pos.set(id, [Math.cos(angle) * r, Math.sin(angle) * r]);
   });
 
   const extras = ids.filter((id) => !pathIndex.has(id));
-  extras.forEach((id, i) => {
-    const ring = (i < 14 ? 0 : i < 34 ? 1 : 2) as 0 | 1 | 2;
-    const k = ring === 0 ? i : ring === 1 ? i - 14 : i - 34;
-    const nOn =
-      ring === 0
-        ? Math.min(14, extras.length)
-        : ring === 1
-          ? Math.min(20, Math.max(0, extras.length - 14))
-          : Math.max(1, extras.length - 34);
-    const h = hash32(id);
-    const angle =
-      (k / Math.max(nOn, 1)) * Math.PI * 2 + ((h % 9) - 4) * 0.05;
-    const r = RING_R[ring];
-    pos.set(id, [Math.cos(angle) * r, Math.sin(angle) * r]);
+  const inner = extras.slice(0, 15);
+  const mid = extras.slice(15, 40);
+  const outerExtra = extras.slice(40);
+  placeClusters(inner, RING_R[0], 3, pos);
+  placeClusters(mid, RING_R[1], 5, pos);
+  outerExtra.forEach((id, i) => {
+    const t = (i + 0.5) / Math.max(outerExtra.length, 1);
+    const angle = -2.55 + t * 4.2 + 0.16;
+    pos.set(id, [Math.cos(angle) * RING_R[2], Math.sin(angle) * RING_R[2]]);
   });
 
   const minArc = 0.13;
@@ -300,13 +295,33 @@ function layoutRings(
     }
     uniqueWalk.forEach((id, i) => {
       const t = i / Math.max(nPath - 1, 1);
-      const angle = -2.45 + t * 4.55;
+      const angle = -2.55 + t * 4.2;
       const r = RING_R[2];
       const p = pos.get(id)!;
-      p[0] += (Math.cos(angle) * r - p[0]) * 0.55;
-      p[1] += (Math.sin(angle) * r - p[1]) * 0.55;
+      p[0] += (Math.cos(angle) * r - p[0]) * 0.62;
+      p[1] += (Math.sin(angle) * r - p[1]) * 0.62;
     });
   }
 
   return pos;
+}
+
+function placeClusters(
+  ids: string[],
+  r: number,
+  clusters: number,
+  pos: Map<string, [number, number]>,
+): void {
+  if (!ids.length) return;
+  const groups: string[][] = Array.from({ length: clusters }, () => []);
+  ids.forEach((id, i) => groups[i % clusters]!.push(id));
+  groups.forEach((g, gi) => {
+    const base = (gi / clusters) * Math.PI * 2 - 0.55;
+    g.forEach((id, j) => {
+      const spread = (j - (g.length - 1) / 2) * 0.155;
+      const h = hash32(id);
+      const angle = base + spread + ((h % 5) - 2) * 0.02;
+      pos.set(id, [Math.cos(angle) * r, Math.sin(angle) * r]);
+    });
+  });
 }

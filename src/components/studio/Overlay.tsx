@@ -10,22 +10,8 @@ export function Overlay() {
   const [prime, setPrime] = useState(false);
 
   return (
-    <div className="pointer-events-none absolute inset-0 flex flex-col justify-between p-4 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <p className="font-display text-[1.35rem] leading-none tracking-[-0.04em] text-fg sm:text-2xl">
-            Cayley
-          </p>
-          <p className="mt-2 max-w-[22rem] text-xs leading-relaxed text-muted text-pretty">
-            Click a sticker to turn. Click a node to walk the graph.
-          </p>
-        </div>
-        <p className="font-mono text-[11px] tabular-nums text-dim sm:text-xs">
-          {s.ready ? `${s.step}/${s.total}` : "…"}
-        </p>
-      </header>
-
-      <div className="pointer-events-auto flex max-w-full flex-col gap-2">
+    <footer className="dock pointer-events-auto shrink-0 border-t border-border bg-elevated px-3 py-2.5 pb-[max(0.65rem,env(safe-area-inset-bottom))] sm:px-6">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <div className="flex flex-wrap items-center gap-1.5">
           {FACES.map((face) => {
             const move = (prime ? `${face}'` : face) as Move;
@@ -36,7 +22,9 @@ export function Overlay() {
                 variant="quiet"
                 className="min-w-11 font-mono"
                 onClick={() => stage?.applyMove(move)}
-                aria-label={prime ? `${face} counterclockwise` : `${face} clockwise`}
+                aria-label={
+                  prime ? `${face} counterclockwise` : `${face} clockwise`
+                }
               >
                 {face}
                 {prime ? "′" : ""}
@@ -89,12 +77,12 @@ export function Overlay() {
             <Shuffle />
             New path
           </Button>
-          <p className="text-xs text-dim">
+          <p className="hidden text-xs text-dim sm:block">
             {s.phase}
             {s.moveLabel ? ` · ${s.moveLabel}` : ""}
           </p>
         </div>
       </div>
-    </div>
+    </footer>
   );
 }

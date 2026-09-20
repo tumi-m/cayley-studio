@@ -34,13 +34,13 @@ export const FACE_RH: Record<Face, number> = {
 
 /** Illustrated cube palette — light plastic, sticker colours from the reference. */
 export const COLOR = {
-  U: 0xf6f5f1,
-  D: 0xf0c33c,
-  F: 0x3a9b4a,
-  B: 0x2f62c4,
-  L: 0xe07a2f,
-  R: 0xd23b32,
-  PLASTIC: 0xe9e6df,
+  U: 0xf7f6f2,
+  D: 0xf0c12e,
+  F: 0x2f9a48,
+  B: 0x2c5ec4,
+  L: 0xe87828,
+  R: 0xd1322c,
+  PLASTIC: 0xf2f0ea,
 } as const;
 
 export const COLOR_ID: Record<Face, number> = {

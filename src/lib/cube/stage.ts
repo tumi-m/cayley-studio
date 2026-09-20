@@ -34,7 +34,7 @@ import {
   type Face,
   type Move,
 } from "./model";
-import { bfsMoves, buildPathGraph, type CubeGraph } from "./graph";
+import { bfsMoves, buildPathGraph, RING_R, type CubeGraph } from "./graph";
 
 export interface StageSnapshot {
   playing: boolean;
@@ -52,10 +52,10 @@ const BG = 0xf7f4ec;
 
 const PLASTIC = new MeshPhysicalMaterial({
   color: COLOR.PLASTIC,
-  roughness: 0.55,
-  metalness: 0.02,
-  clearcoat: 0.18,
-  clearcoatRoughness: 0.55,
+  roughness: 0.48,
+  metalness: 0.04,
+  clearcoat: 0.35,
+  clearcoatRoughness: 0.42,
 });
 
 const stickerCache = new Map<number, MeshPhysicalMaterial>();
@@ -64,10 +64,10 @@ function stickerMat(hex: number): MeshPhysicalMaterial {
   if (!m) {
     m = new MeshPhysicalMaterial({
       color: hex,
-      roughness: 0.38,
+      roughness: 0.32,
       metalness: 0,
-      clearcoat: 0.22,
-      clearcoatRoughness: 0.4,
+      clearcoat: 0.35,
+      clearcoatRoughness: 0.28,
     });
     stickerCache.set(hex, m);
   }
@@ -150,7 +150,7 @@ export class CayleyStage {
     move: Move;
   } | null = null;
 
-  private spherical = { theta: 0.72, phi: 0.98, radius: 6.35 };
+  private spherical = { theta: 0.64, phi: 0.9, radius: 4.15 };
   private dragging = false;
   private dragMoved = false;
   private lastPtr = new Vector2();
@@ -162,6 +162,7 @@ export class CayleyStage {
     panY: number;
   } | null = null;
   private ro: ResizeObserver | null = null;
+  private userZoomed = false;
 
   speed = 1;
   playing = true;
@@ -183,19 +184,19 @@ export class CayleyStage {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setClearColor(BG, 1);
     this.renderer.toneMapping = ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.12;
+    this.renderer.toneMappingExposure = 1.22;
     this.renderer.outputColorSpace = SRGBColorSpace;
 
     this.scene = new Scene();
     this.scene.background = new Color(BG);
-    this.camera = new PerspectiveCamera(32, 1, 0.1, 80);
+    this.camera = new PerspectiveCamera(26, 1, 0.1, 80);
 
-    this.scene.add(new HemisphereLight(0xfffbf3, 0xd9d2c4, 1.15));
-    const key = new DirectionalLight(0xfffaf2, 1.15);
-    key.position.set(4.5, 8, 5.5);
+    this.scene.add(new HemisphereLight(0xfffbf4, 0xddd6c8, 1.35));
+    const key = new DirectionalLight(0xfffaf4, 0.95);
+    key.position.set(5, 9, 4);
     this.scene.add(key);
-    const fill = new DirectionalLight(0xe8eef8, 0.45);
-    fill.position.set(-6, 2, -3);
+    const fill = new DirectionalLight(0xeef2fa, 0.55);
+    fill.position.set(-5, 3, -2);
     this.scene.add(fill);
 
     this.heroRoot.add(this.pivot);
@@ -235,11 +236,20 @@ export class CayleyStage {
     this.queue = [];
     this.history = [];
     const s = seed ?? (Math.random() * 0xffffffff) >>> 0;
-    this.graph = buildPathGraph(s, 10);
+    this.graph = buildPathGraph(s, 12);
     this.resetLogical();
-    this.walkCursor = 0;
-    this.trail = 0;
-    this.beginScramble();
+    for (const mv of this.graph.scramble) this.logical.apply(mv);
+    this.snapHero();
+    this.walkCursor = this.graph.walk.length - 1;
+    this.trail = this.walkCursor;
+    this.history = this.graph.scramble.slice();
+    this.playing = false;
+    this.phase = "hold";
+    this.holdLeft = 0;
+    this.queueKind = "solve";
+    this.phaseLabel = "Path";
+    this.userZoomed = false;
+    this.fitRadius();
     this.emit();
   }
 
@@ -463,8 +473,8 @@ export class CayleyStage {
     this.cubieMeshes = [];
     this.stickerMeshes = [];
     this.logical = Cube.solved(3);
-    const bodyGeo = new RoundedBoxGeometry(0.94, 0.94, 0.94, 3, 0.1);
-    const stickerGeo = new RoundedBoxGeometry(0.74, 0.74, 0.05, 2, 0.13);
+    const bodyGeo = new RoundedBoxGeometry(0.95, 0.95, 0.95, 4, 0.12);
+    const stickerGeo = new RoundedBoxGeometry(0.78, 0.78, 0.048, 3, 0.16);
     const normals: [number, number, number][] = [
       [1, 0, 0],
       [-1, 0, 0],
@@ -516,7 +526,7 @@ export class CayleyStage {
       radius * Math.cos(p),
       radius * Math.sin(p) * Math.sin(theta),
     );
-    this.camera.lookAt(0, -0.08, 0);
+    this.camera.lookAt(0, 0, 0);
   }
 
   private currentId(): string | null {
@@ -538,17 +548,16 @@ export class CayleyStage {
     ctx.fillStyle = "#f7f4ec";
     ctx.fillRect(0, 0, w, h);
 
-    const fit = Math.min(w, h) * 0.5 * this.graphPan.scale;
+    const fit = Math.min(w, h) * 0.52 * this.graphPan.scale;
     ctx.save();
     ctx.translate(w / 2 + this.graphPan.x, h / 2 + this.graphPan.y);
     ctx.scale(fit, fit);
 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    const rings = [0.3, 0.56, 0.82];
-    ctx.strokeStyle = "rgba(70, 66, 60, 0.22)";
-    ctx.lineWidth = 0.012;
-    for (const r of rings) {
+    ctx.strokeStyle = "rgba(60, 56, 50, 0.28)";
+    ctx.lineWidth = 0.016;
+    for (const r of RING_R) {
       ctx.beginPath();
       ctx.arc(0, 0, r, 0, Math.PI * 2);
       ctx.stroke();
@@ -558,8 +567,8 @@ export class CayleyStage {
     const hover = this.hoverId;
 
     if (hover) {
-      ctx.strokeStyle = "rgba(70, 66, 60, 0.28)";
-      ctx.lineWidth = 0.01;
+      ctx.strokeStyle = "rgba(60, 56, 50, 0.32)";
+      ctx.lineWidth = 0.012;
       ctx.beginPath();
       for (const nb of graph.adj.get(hover) ?? []) {
         const a = graph.nodes[graph.idToIndex.get(hover)!];
@@ -571,30 +580,37 @@ export class CayleyStage {
       ctx.stroke();
     }
 
-    ctx.strokeStyle = "#2a2926";
-    ctx.lineWidth = 0.028;
-    ctx.beginPath();
     const last = Math.max(this.trail, 0);
-    for (let i = 0; i < last; i++) {
-      const a = graph.nodes[graph.idToIndex.get(graph.walk[i]!)!];
-      const b = graph.nodes[graph.idToIndex.get(graph.walk[i + 1]!)!];
-      if (!a || !b) continue;
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
+    const pathPts: { x: number; y: number }[] = [];
+    for (let i = 0; i <= last; i++) {
+      const n = graph.nodes[graph.idToIndex.get(graph.walk[i]!)!];
+      if (n) pathPts.push(n);
     }
-    ctx.stroke();
+    if (pathPts.length >= 2) {
+      let a0 = Math.atan2(pathPts[0]!.y, pathPts[0]!.x);
+      let a1 = Math.atan2(
+        pathPts[pathPts.length - 1]!.y,
+        pathPts[pathPts.length - 1]!.x,
+      );
+      while (a1 < a0) a1 += Math.PI * 2;
+      ctx.strokeStyle = "#241f1c";
+      ctx.lineWidth = 0.034;
+      ctx.beginPath();
+      ctx.arc(0, 0, RING_R[2], a0, a1, false);
+      ctx.stroke();
+    }
 
-    const rNode = 0.064;
+    const rNode = 0.074;
     for (const node of graph.nodes) {
       const isCurrent = node.id === current;
       const isHover = node.id === hover;
-      const rad = isCurrent ? rNode * 1.55 : isHover ? rNode * 1.28 : rNode;
+      const rad = isCurrent ? rNode * 1.42 : isHover ? rNode * 1.22 : rNode;
       ctx.beginPath();
       ctx.arc(node.x, node.y, rad, 0, Math.PI * 2);
       ctx.fillStyle = cssHex(node.color);
       ctx.fill();
-      ctx.lineWidth = isCurrent ? 0.014 : 0.007;
-      ctx.strokeStyle = isCurrent ? "#1c1b18" : "rgba(28, 27, 24, 0.35)";
+      ctx.lineWidth = isCurrent ? 0.016 : 0.008;
+      ctx.strokeStyle = isCurrent ? "#1c1b18" : "rgba(28, 27, 24, 0.38)";
       ctx.stroke();
     }
 
@@ -608,11 +624,11 @@ export class CayleyStage {
     const rect = canvas.getBoundingClientRect();
     const w = rect.width;
     const h = rect.height;
-    const fit = Math.min(w, h) * 0.5 * this.graphPan.scale;
+    const fit = Math.min(w, h) * 0.52 * this.graphPan.scale;
     const x = (e.clientX - rect.left - w / 2 - this.graphPan.x) / fit;
     const y = (e.clientY - rect.top - h / 2 - this.graphPan.y) / fit;
     let best: string | null = null;
-    let bestD = 0.09;
+    let bestD = 0.12;
     for (const node of graph.nodes) {
       const d = Math.hypot(node.x - x, node.y - y);
       if (d < bestD) {
@@ -631,6 +647,7 @@ export class CayleyStage {
     this.camera.aspect = cw / Math.max(ch, 1);
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(cw, ch, false);
+    this.fitRadius();
 
     const gw = graphParent?.clientWidth || window.innerWidth / 2;
     const gh = graphParent?.clientHeight || window.innerHeight;
@@ -640,6 +657,18 @@ export class CayleyStage {
     this.graphCanvas.style.width = `${gw}px`;
     this.graphCanvas.style.height = `${gh}px`;
   };
+
+  private fitRadius(): void {
+    if (this.userZoomed) return;
+    const parent = this.cubeCanvas.parentElement;
+    const cw = Math.max(parent?.clientWidth || 1, 1);
+    const ch = Math.max(parent?.clientHeight || 1, 1);
+    const fov = (this.camera.fov * Math.PI) / 180;
+    const span = 3.05;
+    const fill = ch / cw < 0.88 ? 0.8 : 0.68;
+    const dist = span / 2 / Math.tan(fov / 2) / fill;
+    this.spherical.radius = Math.min(6.2, Math.max(3.15, dist));
+  }
 
   private onDown = (e: PointerEvent): void => {
     this.dragging = true;
@@ -678,9 +707,10 @@ export class CayleyStage {
   }
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
+    this.userZoomed = true;
     this.spherical.radius = Math.min(
       11,
-      Math.max(4.6, this.spherical.radius + e.deltaY * 0.01),
+      Math.max(3.4, this.spherical.radius + e.deltaY * 0.01),
     );
   };
 
